@@ -1,12 +1,12 @@
 //! `bimcraft-cli`: BIMCraft from the command line. Scripts, conversion, and an MCP server for
 //! agents, all through the same commands.
 
-mod mcp;
-
 use std::io::Write;
 use std::process::ExitCode;
+mod relay;
 
 use bimcraft_core::engine::{Session, catalog};
+use bimcraft_core::mcp;
 use bimcraft_core::sample::SAMPLE;
 use serde_json::{Value, json};
 
@@ -19,6 +19,8 @@ const USAGE: &str = "USAGE:
   bimcraft-cli convert IN OUT    a project or an IFC file to .ifc, .svg, .png or .bimcraft
   bimcraft-cli commands          every command and its parameters
   bimcraft-cli mcp               an MCP server on stdio, for agents
+  bimcraft-cli mcp --live[=ADDR] the same, run in the open BIMCraft window started with --live (127.0.0.1:47833 or ADDR),
+                                 so the agent builds on screen; with no window listening, headless as above
   bimcraft-cli --version         the release";
 
 fn print(out: &mut impl Write, v: &Value) -> Result<(), String> {
@@ -69,16 +71,47 @@ fn cli(args: &[String], out: &mut impl Write) -> Result<(), String> {
     }
 }
 
+/// `mcp [--live[=ADDR]]`: headless, or relayed to the window's live link when one listens.
+fn mcp_main(args: &[String]) -> ExitCode {
+    let live = match args {
+        [] => None,
+        [flag] if flag == "--live" => Some(mcp::LIVE_ADDR),
+        [flag] if flag.starts_with("--live=") => Some(&flag["--live=".len()..]),
+        _ => {
+            eprintln!("bimcraft-cli: mcp takes only --live[=ADDR]\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = match live.map(mcp::live_addr) {
+        Some(Err(e)) => {
+            eprintln!("bimcraft-cli mcp: {e}");
+            return ExitCode::FAILURE;
+        }
+        Some(Ok(addr)) => match relay::connect(addr) {
+            Some(stream) => {
+                eprintln!("bimcraft-cli mcp: live, in the BIMCraft window on {addr}");
+                relay::relay(stream, std::io::stdin().lock(), std::io::stdout().lock())
+            }
+            None => {
+                eprintln!("bimcraft-cli mcp: no BIMCraft window listens on {addr} (start it with --live); serving headless");
+                mcp::Server::new().serve(std::io::stdin().lock(), std::io::stdout().lock())
+            }
+        },
+        None => mcp::Server::new().serve(std::io::stdin().lock(), std::io::stdout().lock()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("bimcraft-cli mcp: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "mcp") {
-        return match mcp::Server::new().serve(std::io::stdin().lock(), std::io::stdout().lock()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("bimcraft-cli mcp: {e}");
-                ExitCode::FAILURE
-            }
-        };
+        return mcp_main(&args[1..]);
     }
     match cli(&args, &mut std::io::stdout().lock()) {
         Ok(()) => ExitCode::SUCCESS,

@@ -11,6 +11,7 @@ mod favorites;
 mod footer;
 mod graphics;
 pub mod lang;
+pub mod live;
 mod mep;
 mod orbit;
 mod paper;
@@ -482,6 +483,8 @@ pub struct BimApp {
     styled: bool,
     /// The updater, which the desktop app attaches: a window starts without one, and so never phones home.
     pub updates: Option<bimcraft_update::Updater>,
+    /// The live link, when the app was started with it: an agent's commands run on this session, on screen.
+    pub live: Option<live::Live>,
 }
 
 /// The Options Bar's Height: up to a level above the plan's `level` (by default the next one up),
@@ -742,6 +745,7 @@ impl BimApp {
             title: String::new(),
             styled: false,
             updates: None,
+            live: None,
         }
     }
 
@@ -756,6 +760,24 @@ impl BimApp {
     }
 
     /// Run a command; when it fails, say why.
+    /// Run what the live link's agent sent since the last frame, on this session as the window's own commands run, and
+    /// answer it; a new or opened project starts the window over on it, as File > New and Open do.
+    pub fn serve_live(&mut self) {
+        let Some(jobs) = self.live.as_ref().map(live::Live::waiting) else { return };
+        for job in jobs {
+            self.made_in();
+            let over = bimcraft_core::mcp::starts_over(&job.line);
+            let before = Arc::clone(&self.session.model);
+            let answer = bimcraft_core::mcp::reply(&mut self.session, &job.line);
+            if over && !Arc::ptr_eq(&before, &self.session.model) {
+                self.reopened();
+            }
+            self.active_option = self.session.option.clone();
+            // The agent may have gone meanwhile: nothing waits for the answer then.
+            let _ = job.reply.send(answer);
+        }
+    }
+
     fn run(&mut self, id: &str, params: Value) -> Option<Value> {
         self.made_in();
         match self.session.execute(id, &params) {
@@ -884,6 +906,7 @@ impl BimApp {
         }
         style::follow(&ctx);
         lang::set(self.lang);
+        self.serve_live();
         self.tidy();
         self.poll_updates(&ctx);
         self.keys(&ctx);
@@ -1754,6 +1777,7 @@ impl BimApp {
         (fresh.thin, fresh.show_properties, fresh.show_browser, fresh.lang, fresh.snaps) =
             (self.thin, self.show_properties, self.show_browser, self.lang, self.snaps);
         fresh.updates = self.updates.take();
+        fresh.live = self.live.take();
         *self = fresh;
     }
 

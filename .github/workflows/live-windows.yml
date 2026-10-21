@@ -1,0 +1,38 @@
+# Windows builds of a branch, to try a change before it is released: bimcraft.exe and bimcraft-cli.exe in one zip,
+# an artifact of the run (no installer, no release). Runs on each push to a branch other than main, or by hand.
+
+name: Windows build
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p bimcraft -p bimcraft-cli
+
+      - name: Test
+        run: cargo test --locked -p bimcraft-core --lib mcp && cargo test --locked -p bimcraft-cli && cargo test --locked -p bimcraft-ui-egui --lib live
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          $bin = "target\x86_64-pc-windows-msvc\release"
+          Compress-Archive -Path "$bin\bimcraft.exe", "$bin\bimcraft-cli.exe" -DestinationPath bimcraft-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bimcraft-windows-x64
+          path: bimcraft-windows-x64.zip

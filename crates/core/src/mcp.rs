@@ -1,9 +1,12 @@
 //! BIMCraft's MCP server: JSON-RPC 2.0 over stdio, one message per line (MCP's stdio transport).
-//! Its tools run the same commands as the CLI and scripts, on a headless session.
+//! Its tools run the same commands as the CLI and scripts: on a headless session (`bimcraft-cli mcp`), or on the
+//! desktop's own, live, through [`reply`] (`bimcraft --live` listens on [`LIVE_ADDR`], `bimcraft-cli mcp --live` relays to it).
 
 use std::io::{BufRead, Write};
 
-use bimcraft_core::engine::{Session, catalog};
+use std::net::SocketAddr;
+
+use crate::engine::{Session, catalog};
 use serde_json::{Value, json};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -28,8 +31,21 @@ parameters. Check your work with inspect_model and query_elements, look at it wi
 ceiling: true its reflected ceiling plan, of a section or elevation by name, or of the 3D view with view \"{3D}\"), and save \
 to .bimcraft or .ifc.";
 
+/// Where the desktop's live link listens unless told otherwise: this machine only.
+pub const LIVE_ADDR: &str = "127.0.0.1:47833";
+
+/// A live link's address: `host:port` on this machine (a loopback address), never one another machine could reach.
+pub fn live_addr(text: &str) -> Result<SocketAddr, String> {
+    let addr: SocketAddr = text.trim().parse().map_err(|e| format!("`{text}` is not an address such as {LIVE_ADDR}: {e}"))?;
+    if addr.ip().is_loopback() {
+        Ok(addr)
+    } else {
+        Err(format!("the live link listens on this machine only (127.0.0.1 or [::1]), not on {}", addr.ip()))
+    }
+}
+
 pub struct Server {
-    session: Session,
+    pub session: Session,
 }
 
 impl Default for Server {
@@ -93,136 +109,165 @@ impl Server {
     }
 
     pub fn handle_line(&mut self, line: &str) -> Option<String> {
-        let line = line.trim();
-        if line.is_empty() {
+        reply(&mut self.session, line)
+    }
+}
+
+/// The reply to one line of the protocol, run on `s`: none for a notification or a blank line.
+pub fn reply(s: &mut Session, line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let reply = match serde_json::from_str::<Value>(line) {
+        Ok(Value::Array(batch)) if batch.is_empty() => Some(error(Value::Null, INVALID_REQUEST, "empty batch")),
+        Ok(Value::Array(batch)) => {
+            let replies: Vec<Value> = batch.into_iter().filter_map(|m| handle(s, m)).collect();
+            (!replies.is_empty()).then_some(Value::Array(replies))
+        }
+        Ok(msg) => handle(s, msg),
+        Err(e) => Some(error(Value::Null, PARSE_ERROR, format!("parse error: {e}"))),
+    };
+    reply.map(|r| r.to_string())
+}
+
+fn handle(s: &mut Session, msg: Value) -> Option<Value> {
+    let Some(o) = msg.as_object() else { return Some(error(Value::Null, INVALID_REQUEST, "a message must be an object")) };
+    let id = o.get("id").cloned();
+    let Some(method) = o.get("method").and_then(Value::as_str) else {
+        // A response to us: there is nothing to answer.
+        if o.contains_key("result") || o.contains_key("error") {
             return None;
         }
-        let reply = match serde_json::from_str::<Value>(line) {
-            Ok(Value::Array(batch)) if batch.is_empty() => Some(error(Value::Null, INVALID_REQUEST, "empty batch")),
-            Ok(Value::Array(batch)) => {
-                let replies: Vec<Value> = batch.into_iter().filter_map(|m| self.handle(m)).collect();
-                (!replies.is_empty()).then_some(Value::Array(replies))
-            }
-            Ok(msg) => self.handle(msg),
-            Err(e) => Some(error(Value::Null, PARSE_ERROR, format!("parse error: {e}"))),
-        };
-        reply.map(|r| r.to_string())
-    }
+        return Some(error(id.unwrap_or(Value::Null), INVALID_REQUEST, "missing `method`"));
+    };
+    // Notifications (no id) get no reply.
+    let id = id?;
+    let params = o.get("params").cloned().unwrap_or(Value::Null);
+    Some(match request(s, method, &params) {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err((code, message)) => error(id, code, message),
+    })
+}
 
-    fn handle(&mut self, msg: Value) -> Option<Value> {
-        let Some(o) = msg.as_object() else { return Some(error(Value::Null, INVALID_REQUEST, "a message must be an object")) };
-        let id = o.get("id").cloned();
-        let Some(method) = o.get("method").and_then(Value::as_str) else {
-            // A response to us: there is nothing to answer.
-            if o.contains_key("result") || o.contains_key("error") {
-                return None;
-            }
-            return Some(error(id.unwrap_or(Value::Null), INVALID_REQUEST, "missing `method`"));
-        };
-        // Notifications (no id) get no reply.
-        let id = id?;
-        let params = o.get("params").cloned().unwrap_or(Value::Null);
-        Some(match self.request(method, &params) {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            Err((code, message)) => error(id, code, message),
-        })
+fn request(s: &mut Session, method: &str, params: &Value) -> Result<Value, (i64, String)> {
+    match method {
+        "initialize" => {
+            let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
+            let version = if SUPPORTED.contains(&asked) { asked } else { PROTOCOL_VERSION };
+            Ok(json!({
+                "protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "bimcraft", "title": "BIMCraft", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": INSTRUCTIONS,
+            }))
+        }
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tools() })),
+        "tools/call" => {
+            let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
+            call(s, name, params.get("arguments").unwrap_or(&Value::Null))
+        }
+        _ => Err((METHOD_NOT_FOUND, format!("method `{method}` not found"))),
     }
+}
 
-    fn request(&mut self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
-        match method {
-            "initialize" => {
-                let asked = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
-                let version = if SUPPORTED.contains(&asked) { asked } else { PROTOCOL_VERSION };
-                Ok(json!({
-                    "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "bimcraft", "title": "BIMCraft", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": INSTRUCTIONS,
-                }))
-            }
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tools() })),
-            "tools/call" => {
-                let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
-                self.call(name, params.get("arguments").unwrap_or(&Value::Null))
-            }
-            _ => Err((METHOD_NOT_FOUND, format!("method `{method}` not found"))),
+/// A tool call. `Err` is a protocol error (unknown tool, arguments that aren't an object or lack
+/// a required one); a tool that runs and fails answers with `isError`.
+fn call(s: &mut Session, name: &str, args: &Value) -> Result<Value, (i64, String)> {
+    let tools = tools();
+    let tool = tools
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["name"] == name))
+        .ok_or_else(|| (INVALID_PARAMS, format!("unknown tool `{name}`")))?;
+    let args = match args {
+        Value::Null => json!({}),
+        Value::Object(_) => args.clone(),
+        _ => return Err((INVALID_PARAMS, format!("the arguments of `{name}` must be an object"))),
+    };
+    for key in tool["inputSchema"]["required"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        if args.get(key).is_none_or(Value::is_null) {
+            return Err((INVALID_PARAMS, format!("`{name}` needs `{key}`")));
         }
     }
-
-    /// A tool call. `Err` is a protocol error (unknown tool, arguments that aren't an object or lack
-    /// a required one); a tool that runs and fails answers with `isError`.
-    fn call(&mut self, name: &str, args: &Value) -> Result<Value, (i64, String)> {
-        let tools = tools();
-        let tool = tools
-            .as_array()
-            .and_then(|a| a.iter().find(|t| t["name"] == name))
-            .ok_or_else(|| (INVALID_PARAMS, format!("unknown tool `{name}`")))?;
-        let args = match args {
-            Value::Null => json!({}),
-            Value::Object(_) => args.clone(),
-            _ => return Err((INVALID_PARAMS, format!("the arguments of `{name}` must be an object"))),
-        };
-        for key in tool["inputSchema"]["required"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-            if args.get(key).is_none_or(Value::is_null) {
-                return Err((INVALID_PARAMS, format!("`{name}` needs `{key}`")));
-            }
+    let result = match name {
+        "execute" => {
+            let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
+            s.execute(args["command"].as_str().unwrap_or_default(), &params)
         }
-        let s = &mut self.session;
-        let result = match name {
-            "execute" => {
-                let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
-                s.execute(args["command"].as_str().unwrap_or_default(), &params)
-            }
-            "script" => s.script(args["text"].as_str().unwrap_or_default()).map(|results| json!({ "results": results })),
-            "list_commands" => {
-                let filter = args["filter"].as_str().map(str::to_ascii_lowercase).unwrap_or_default();
-                let has = |v: &Value| v.as_str().is_some_and(|t| t.to_ascii_lowercase().contains(&filter));
-                let all = catalog();
-                Ok(all
-                    .as_array()
-                    .map(|cmds| {
-                        cmds.iter()
-                            .filter(|c| has(&c["id"]) || has(&c["label"]) || c["aliases"].as_array().is_some_and(|a| a.iter().any(has)))
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default())
-            }
-            "inspect_model" => s.execute("inspect", &json!({})),
-            "query_elements" => s.execute("elements", &args),
-            "schedule" => s.execute("schedule", &args),
-            "new_model" => s.execute("new", &args),
-            "open" => s.execute("open", &args),
-            "save" => s.execute("save", &args),
-            "render" => {
-                let keys = ["view", "ceiling", "width", "height", "azimuth", "elevation"];
-                let view: serde_json::Map<String, Value> = keys.iter().map(|k| (k.to_string(), args[*k].clone())).collect();
-                return Ok(match s.execute("render", &Value::Object(view)) {
-                    Ok(v) => {
-                        let name = v["view"].as_str().unwrap_or("");
-                        let what = match v["kind"].as_str() {
-                            Some("3D view") => {
-                                let deg = |k: &str| v[k].as_f64().unwrap_or_default();
-                                format!("3D view from {}° round, {}° up", deg("azimuth"), deg("elevation"))
-                            }
-                            Some(kind) => format!("{name} ({kind})"),
-                            None => name.to_string(),
-                        };
-                        json!({"content": [
-                            {"type": "image", "data": v["pngBase64"], "mimeType": "image/png"},
-                            {"type": "text", "text": format!("{what}, {} x {} px", v["width"], v["height"])},
-                        ]})
-                    }
-                    Err(e) => tool_error(&e),
-                });
-            }
-            _ => return Err((INVALID_PARAMS, format!("unknown tool `{name}`"))),
-        };
-        Ok(match result {
-            Ok(v) => text(&v),
-            Err(e) => tool_error(&e),
-        })
+        "script" => s.script(args["text"].as_str().unwrap_or_default()).map(|results| json!({ "results": results })),
+        "list_commands" => {
+            let filter = args["filter"].as_str().map(str::to_ascii_lowercase).unwrap_or_default();
+            let has = |v: &Value| v.as_str().is_some_and(|t| t.to_ascii_lowercase().contains(&filter));
+            let all = catalog();
+            Ok(all
+                .as_array()
+                .map(|cmds| {
+                    cmds.iter()
+                        .filter(|c| has(&c["id"]) || has(&c["label"]) || c["aliases"].as_array().is_some_and(|a| a.iter().any(has)))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default())
+        }
+        "inspect_model" => s.execute("inspect", &json!({})),
+        "query_elements" => s.execute("elements", &args),
+        "schedule" => s.execute("schedule", &args),
+        "new_model" => s.execute("new", &args),
+        "open" => s.execute("open", &args),
+        "save" => s.execute("save", &args),
+        "render" => {
+            let keys = ["view", "ceiling", "width", "height", "azimuth", "elevation"];
+            let view: serde_json::Map<String, Value> = keys.iter().map(|k| (k.to_string(), args[*k].clone())).collect();
+            return Ok(match s.execute("render", &Value::Object(view)) {
+                Ok(v) => {
+                    let name = v["view"].as_str().unwrap_or("");
+                    let what = match v["kind"].as_str() {
+                        Some("3D view") => {
+                            let deg = |k: &str| v[k].as_f64().unwrap_or_default();
+                            format!("3D view from {}° round, {}° up", deg("azimuth"), deg("elevation"))
+                        }
+                        Some(kind) => format!("{name} ({kind})"),
+                        None => name.to_string(),
+                    };
+                    json!({"content": [
+                        {"type": "image", "data": v["pngBase64"], "mimeType": "image/png"},
+                        {"type": "text", "text": format!("{what}, {} x {} px", v["width"], v["height"])},
+                    ]})
+                }
+                Err(e) => tool_error(&e),
+            });
+        }
+        _ => return Err((INVALID_PARAMS, format!("unknown tool `{name}`"))),
+    };
+    Ok(match result {
+        Ok(v) => text(&v),
+        Err(e) => tool_error(&e),
+    })
+}
+
+/// Whether a line of the protocol asks to start another project (`new_model`, `open`, or a script or `execute` of `new` or
+/// `open`): a front end holding views of the old one starts over on the session's after replying.
+pub fn starts_over(line: &str) -> bool {
+    fn replaces(command: &str) -> bool {
+        crate::engine::find(command).is_some_and(|c| c.id == "new" || c.id == "open")
+    }
+    fn one(msg: &Value) -> bool {
+        if msg["method"] != "tools/call" {
+            return false;
+        }
+        let args = &msg["params"]["arguments"];
+        match msg["params"]["name"].as_str() {
+            Some("new_model" | "open") => true,
+            Some("execute") => args["command"].as_str().is_some_and(replaces),
+            Some("script") => args["text"].as_str().is_some_and(|t| t.lines().filter_map(|l| l.split_whitespace().next()).any(replaces)),
+            _ => false,
+        }
+    }
+    match serde_json::from_str::<Value>(line.trim()) {
+        Ok(Value::Array(batch)) => batch.iter().any(one),
+        Ok(msg) => one(&msg),
+        Err(_) => false,
     }
 }
 
@@ -313,5 +358,42 @@ mod tests {
         s.serve(input.as_bytes(), &mut out).unwrap();
         let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.iter().map(|l| l["id"].as_u64()).collect::<Vec<_>>(), [Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn a_live_address_is_on_this_machine_only() {
+        assert_eq!(live_addr(LIVE_ADDR).map(|a| a.port()), Ok(47833));
+        assert!(live_addr("[::1]:9000").is_ok());
+        assert!(live_addr("0.0.0.0:47833").unwrap_err().contains("this machine only"));
+        assert!(live_addr("192.168.1.10:47833").is_err());
+        assert!(live_addr("localhost").is_err());
+    }
+
+    #[test]
+    fn reply_runs_on_the_session_it_is_given() {
+        let mut session = Session::new();
+        let line = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "execute",
+            "arguments": {"command": "wall", "params": {"points": [[0, 0], [4000, 0]]}}}})
+        .to_string();
+        let r: Value = serde_json::from_str(&reply(&mut session, &line).unwrap()).unwrap();
+        assert_ne!(r["result"]["isError"], json!(true), "{r}");
+        assert_eq!(session.model.elements.values().filter(|e| e.category() == "wall").count(), 1);
+        assert!(reply(&mut session, "  ").is_none());
+    }
+
+    #[test]
+    fn starts_over_finds_new_and_open_however_they_are_asked() {
+        let call = |name: &str, args: Value| {
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}).to_string()
+        };
+        assert!(starts_over(&call("new_model", json!({}))));
+        assert!(starts_over(&call("open", json!({"path": "x.bimcraft"}))));
+        assert!(starts_over(&call("execute", json!({"command": "NEW"}))));
+        assert!(starts_over(&call("script", json!({"text": "wall {}\nopen {\"path\": \"a.ifc\"}"}))));
+        assert!(!starts_over(&call("execute", json!({"command": "wall", "params": {}}))));
+        assert!(!starts_over(&call("script", json!({"text": "level {\"elevation\": 3000}"}))));
+        assert!(!starts_over(&call("save", json!({"path": "x.bimcraft"}))));
+        assert!(starts_over(&format!("[{}]", call("new_model", json!({})))));
+        assert!(!starts_over("{not json"));
     }
 }

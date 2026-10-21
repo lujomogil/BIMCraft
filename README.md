@@ -390,6 +390,20 @@ or to any MCP client's configuration:
 { "mcpServers": { "bimcraft": { "command": "/path/to/bimcraft-cli", "args": ["mcp"] } } }
 ```
 
+### Live, in the open window
+
+To watch an agent build, start the desktop app with `--live` (or set `BIMCRAFT_LIVE=1`) and give the agent
+`bimcraft-cli mcp --live` instead:
+
+```json
+{ "mcpServers": { "bimcraft": { "command": "/path/to/bimcraft-cli", "args": ["mcp", "--live"] } } }
+```
+
+The window listens on `127.0.0.1:47833` (`--live=ADDR` for another port; this machine only) and runs each of the agent's
+messages on its own session at the start of a frame, through the same commands as its tools: what the agent builds appears
+on screen as it goes, is one undo step a command, and is unsaved work until saved. A new or opened project starts the window
+over on it. With no window listening, `mcp --live` serves headless, as `mcp` does, and says so on stderr.
+
 | Tool | What it does |
 |---|---|
 | `execute {command, params}` | Any command with JSON parameters |

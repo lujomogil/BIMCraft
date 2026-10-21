@@ -7,13 +7,16 @@ use std::process::ExitCode;
 
 use bimcraft_core::engine::Session;
 use bimcraft_core::sample::SAMPLE;
+use bimcraft_ui_egui::live::Live;
 use bimcraft_ui_egui::{BimApp, Status, lang};
 use serde_json::json;
 
-const USAGE: &str = "USAGE: bimcraft [FILE] [--sample]
-  FILE       a .bimcraft project to open, or an .ifc file to import
-  --sample   start on the sample house
-  --version  the release
+const USAGE: &str = "USAGE: bimcraft [FILE] [--sample] [--live[=ADDR]]
+  FILE         a .bimcraft project to open, or an .ifc file to import
+  --sample     start on the sample house
+  --live       let an agent build in this window, live: `bimcraft-cli mcp --live` relays its MCP messages here.
+               It listens on this machine only, on 127.0.0.1:47833 or ADDR. BIMCRAFT_LIVE=1 (or an address) does the same.
+  --version    the release
 
 It looks for a newer version when it starts (File > Check for updates at startup switches that off).
 Set BIMCRAFT_NO_UPDATE_CHECK=1 and it never makes a request.";
@@ -34,6 +37,8 @@ fn main() -> ExitCode {
         let _ = session.execute("new", &json!({"language": language.code()}));
     }
     let mut problem = None;
+    // The live link: off unless the environment or an argument asks for it.
+    let mut live = std::env::var("BIMCRAFT_LIVE").ok().and_then(|v| live_from(&v));
     for arg in std::env::args().skip(1) {
         let done = match arg.as_str() {
             "-h" | "--help" => {
@@ -45,6 +50,14 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--sample" => session.script(SAMPLE).map(|_| ()),
+            "--live" => {
+                live = Some(bimcraft_core::mcp::LIVE_ADDR.to_string());
+                Ok(())
+            }
+            flag if flag.starts_with("--live=") => {
+                live = Some(flag["--live=".len()..].to_string());
+                Ok(())
+            }
             flag if flag.starts_with('-') => {
                 eprintln!("bimcraft: unknown option `{flag}`\n\n{USAGE}");
                 return ExitCode::FAILURE;
@@ -86,6 +99,16 @@ fn main() -> ExitCode {
         if let Some(updates) = app.updates.as_mut() {
             updates.check_at_startup();
         }
+        if let Some(text) = &live {
+            let ctx = cc.egui_ctx.clone();
+            match bimcraft_core::mcp::live_addr(text).and_then(|addr| Live::start(addr, move || ctx.request_repaint())) {
+                Ok(link) => {
+                    app.status = Status { text: format!("Live link on {}: an agent's commands run here.", link.addr), error: false };
+                    app.live = Some(link);
+                }
+                Err(e) => app.status = Status { text: e, error: true },
+            }
+        }
         Ok(Box::new(app))
     };
     match eframe::run_native("BIMCraft", options, Box::new(start)) {
@@ -94,6 +117,16 @@ fn main() -> ExitCode {
             eprintln!("bimcraft: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// What `BIMCRAFT_LIVE` asks for: nothing when empty, `0`, `off` or `false`; the default address for `1`, `on` or `true`;
+/// else the address it gives.
+fn live_from(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" | "no" => None,
+        "1" | "on" | "true" | "yes" => Some(bimcraft_core::mcp::LIVE_ADDR.to_string()),
+        _ => Some(value.trim().to_string()),
     }
 }
 
